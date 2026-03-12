@@ -32,6 +32,8 @@ from mr.config import (  # noqa: E402
     ACOUSTID_BASE_URL,
     DB_DIR,
     DB_FINGERPRINT_JSONL,
+    DB_META_JSONL,
+    DB_TRACK_FP_JSONL,
     DB_TRACK_JSONL,
     DB_TRACK_META_JSONL,
 )
@@ -160,14 +162,33 @@ def main() -> None:
     if args.max_rows:
         _truncate_jsonl_gz(DB_FINGERPRINT_JSONL, args.max_rows)
 
-    # ── Track metadata ───────────────────────────────────────────────
+    # ── Track-fingerprint mapping ─────────────────────────────────────
+    if "track_fingerprint-update" not in day_files:
+        logger.error("No track_fingerprint-update file found")
+        sys.exit(1)
+    _download(day_files["track_fingerprint-update"], DB_TRACK_FP_JSONL)
+    if args.max_rows:
+        _truncate_jsonl_gz(DB_TRACK_FP_JSONL, args.max_rows)
+
+    # ── Track metadata mapping (track_id → meta_id) ──────────────────
+    if "track_meta-update" in day_files:
+        _download(day_files["track_meta-update"], DB_TRACK_META_JSONL)
+        if args.max_rows:
+            _truncate_jsonl_gz(DB_TRACK_META_JSONL, args.max_rows)
+
+    # ── Meta (title / artist / album) ────────────────────────────────
+    if "meta-update" not in day_files:
+        logger.error("No meta-update file found")
+        sys.exit(1)
+    _download(day_files["meta-update"], DB_META_JSONL)
+    if args.max_rows:
+        _truncate_jsonl_gz(DB_META_JSONL, args.max_rows)
+
+    # ── Track records ────────────────────────────────────────────────
     if "track-update" in day_files:
         _download(day_files["track-update"], DB_TRACK_JSONL)
         if args.max_rows:
             _truncate_jsonl_gz(DB_TRACK_JSONL, args.max_rows)
-
-    if "track_meta-update" in day_files:
-        _download(day_files["track_meta-update"], DB_TRACK_META_JSONL)
         if args.max_rows:
             _truncate_jsonl_gz(DB_TRACK_META_JSONL, args.max_rows)
 

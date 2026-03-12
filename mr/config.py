@@ -46,8 +46,10 @@ ACOUSTID_BASE_URL = os.environ.get(
 
 # Local paths for downloaded JSONL dump files
 DB_FINGERPRINT_JSONL = DB_DIR / "fingerprints.jsonl.gz"
+DB_TRACK_FP_JSONL = DB_DIR / "track_fingerprint.jsonl.gz"
 DB_TRACK_JSONL = DB_DIR / "tracks.jsonl.gz"
 DB_TRACK_META_JSONL = DB_DIR / "track_meta.jsonl.gz"
+DB_META_JSONL = DB_DIR / "meta.jsonl.gz"
 
 # ── FAISS index parameters ───────────────────────────────────────────────
 FINGERPRINT_DIM = 120          # number of int32 sub-fingerprints kept per track
