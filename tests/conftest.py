@@ -27,6 +27,7 @@ def _isolate_project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cfg, "LOGS_DIR", tmp_path / "logs")
     monkeypatch.setattr(cfg, "DEBUG_DIR", tmp_path / "debug")
     monkeypatch.setattr(cfg, "DB_DIR", tmp_path / "db")
+    monkeypatch.setattr(cfg, "DB_CACHE_DIR", tmp_path / "db" / "cache")
     monkeypatch.setattr(cfg, "DB_FINGERPRINT_CSV", tmp_path / "db" / "fingerprints.csv")
     monkeypatch.setattr(cfg, "DB_TRACK_CSV", tmp_path / "db" / "tracks.csv")
     monkeypatch.setattr(cfg, "DB_FINGERPRINT_JSONL", tmp_path / "db" / "fingerprints.jsonl.gz")

@@ -3,15 +3,19 @@
 Download the AcoustID database dumps (fingerprints + track metadata).
 
 This script:
-  1. Crawls https://data.acoustid.org via ``index.json`` to find the
-     latest year → month → day of available data.
-  2. Downloads the latest day's **fingerprint** file (large, ~50 MB/day).
-  3. Downloads **all days** in the latest month for the smaller metadata
-     files (``meta-update``, ``track_meta-update``,
-     ``track_fingerprint-update``) and concatenates them so that every
-     track referenced in the fingerprint index has its title / artist /
-     album resolved.
-  4. Optionally truncates to ``--max-rows`` lines (for CI / testing).
+  1. Crawls https://data.acoustid.org via ``index.json`` across **all**
+     years and months.
+  2. Downloads metadata files (``meta-update``, ``track_meta-update``,
+     ``track_fingerprint-update``) for every day, **caching** past days
+     locally so they are only downloaded once.  The current day is always
+     re-downloaded to pick up intra-day updates.
+  3. Downloads the latest day's **fingerprint** file.
+  4. Concatenates all cached + freshly downloaded metadata into merged
+     output files for the index builder.
+
+Concurrency:
+  - All years are processed in parallel (unbounded).
+  - Within each year, up to 50 file downloads run concurrently.
 
 Usage:
     python scripts/download_db.py [--max-rows N]
@@ -20,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import gzip
 import json
 import logging
@@ -27,6 +32,7 @@ import re
 import shutil
 import sys
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Ensure the project root is on sys.path
@@ -35,6 +41,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from mr.config import (  # noqa: E402
     ACOUSTID_BASE_URL,
+    DB_CACHE_DIR,
     DB_DIR,
     DB_FINGERPRINT_JSONL,
     DB_META_JSONL,
@@ -52,12 +59,16 @@ logger = logging.getLogger("download_db")
 
 _HEADERS = {"User-Agent": "MR/1.0"}
 
-# File types that must be collected across the *entire* month so that
-# every track has metadata.  These are small (~1–3 MB each per day).
-_MONTH_WIDE_TYPES = {"meta-update", "track_meta-update", "track_fingerprint-update"}
+# Metadata file types that are collected across the full history.
+_META_TYPES = {"meta-update", "track_meta-update", "track_fingerprint-update"}
+
+# Max concurrent downloads inside a single year.
+_MAX_CONCURRENT_DOWNLOADS = 50
+
+_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-")
 
 
-# ── Directory crawling ───────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────
 
 
 def _fetch_index(url: str) -> list[dict]:
@@ -68,151 +79,166 @@ def _fetch_index(url: str) -> list[dict]:
 
 
 def _pick_latest_dir(entries: list[dict]) -> str:
-    """Return the name of the last directory entry (sorted lexicographically)."""
     dirs = sorted(e["name"] for e in entries if e["name"].endswith("/"))
     if not dirs:
         raise RuntimeError(f"No sub-directories found in listing: {entries!r}")
     return dirs[-1].rstrip("/")
 
 
-def _discover_month(base_url: str) -> tuple[str, str, list[dict]]:
-    """Return ``(latest_year, latest_month, month_file_entries)``."""
-    root_entries = _fetch_index(f"{base_url}/index.json")
-    latest_year = _pick_latest_dir(root_entries)
-    logger.info("Latest year: %s", latest_year)
-
-    year_entries = _fetch_index(f"{base_url}/{latest_year}/index.json")
-    latest_month = _pick_latest_dir(year_entries)
-    logger.info("Latest month: %s", latest_month)
-
-    month_entries = _fetch_index(
-        f"{base_url}/{latest_year}/{latest_month}/index.json"
-    )
-    return latest_year, latest_month, month_entries
+def _cache_path_for(filename: str) -> Path:
+    """Return the local cache path for a remote filename."""
+    return DB_CACHE_DIR / filename
 
 
-def _collect_all_metadata_urls(base_url: str) -> dict[str, list[str]]:
-    """
-    Walk **every** year / month directory and collect URLs for the small
-    metadata file types (``meta-update``, ``track_meta-update``,
-    ``track_fingerprint-update``).
-
-    Returns ``{file_type: [url, …]}`` across *all* available history.
-    """
-    date_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})-")
-    all_urls: dict[str, list[str]] = {}
-
-    root_entries = _fetch_index(f"{base_url}/index.json")
-    year_dirs = sorted(
-        e["name"].rstrip("/") for e in root_entries if e["name"].endswith("/")
-    )
-    logger.info("Scanning %d years for metadata: %s", len(year_dirs), year_dirs)
-
-    for year in year_dirs:
-        year_entries = _fetch_index(f"{base_url}/{year}/index.json")
-        month_dirs = sorted(
-            e["name"].rstrip("/") for e in year_entries if e["name"].endswith("/")
-        )
-        for month in month_dirs:
-            logger.info("  Indexing %s/%s …", year, month)
-            month_entries = _fetch_index(
-                f"{base_url}/{year}/{month}/index.json"
-            )
-            month_base = f"{base_url}/{year}/{month}"
-            for entry in month_entries:
-                fname = entry["name"]
-                if not fname.endswith(".jsonl.gz"):
-                    continue
-                m = date_pattern.match(fname)
-                if not m:
-                    continue
-                file_type = fname[len(m.group(0)):].removesuffix(".jsonl.gz")
-                if file_type in _MONTH_WIDE_TYPES:
-                    all_urls.setdefault(file_type, []).append(
-                        f"{month_base}/{fname}"
-                    )
-
-    for ft, urls in all_urls.items():
-        logger.info("  %s: %d files", ft, len(urls))
-    return all_urls
+def _is_today(date_str: str) -> bool:
+    """True if *date_str* (``YYYY-MM-DD``) is today (UTC)."""
+    return date_str == datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
-def _classify_month_files(
-    base_url: str,
-    year: str,
-    month: str,
-    entries: list[dict],
-) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """
-    Classify the files in a month directory.
-
-    Returns:
-      - ``latest_day_files``: ``{file_type: url}`` for the *latest day*
-        (used for the large fingerprint dump).
-      - ``all_month_files``: ``{file_type: [url, …]}`` for *every day*
-        (used for the smaller metadata files).
-    """
-    files = [e["name"] for e in entries if e["name"].endswith(".jsonl.gz")]
-    date_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})-")
-
-    dates = sorted({m.group(1) for f in files if (m := date_pattern.match(f))})
-    if not dates:
-        raise RuntimeError(f"No dated JSONL files found in {month}")
-    latest_date = dates[-1]
-    logger.info("Latest date: %s  (%d days in month)", latest_date, len(dates))
-
-    month_base = f"{base_url}/{year}/{month}"
-    latest_day_files: dict[str, str] = {}
-    all_month_files: dict[str, list[str]] = {}
-
-    for f in sorted(files):
-        m = date_pattern.match(f)
-        if not m:
-            continue
-        file_type = f[len(m.group(0)):].removesuffix(".jsonl.gz")
-        url = f"{month_base}/{f}"
-
-        if m.group(1) == latest_date:
-            latest_day_files[file_type] = url
-
-        if file_type in _MONTH_WIDE_TYPES:
-            all_month_files.setdefault(file_type, []).append(url)
-
-    return latest_day_files, all_month_files
-
-
-# ── Download helpers ─────────────────────────────────────────────────────
-
-
-def _download(url: str, dest: Path) -> Path:
-    """Download *url* to *dest*."""
-    logger.info("Downloading %s → %s", url, dest)
+def _download_to(url: str, dest: Path) -> Path:
+    """Download *url* → *dest* (raw bytes, no decompression)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url, headers=_HEADERS)  # noqa: S310
     with urllib.request.urlopen(req) as resp, open(dest, "wb") as f_out:  # noqa: S310
         shutil.copyfileobj(resp, f_out)
-    logger.info("Download complete (%d bytes)", dest.stat().st_size)
     return dest
 
 
-def _download_and_concat(urls: list[str], dest: Path) -> Path:
+# ── Per-year download logic ─────────────────────────────────────────────
+
+
+def _download_one_file(url: str, filename: str, date_str: str) -> Path:
     """
-    Download multiple gzipped JSONL files and concatenate their contents
-    into a single gzipped JSONL file at *dest*.
+    Download a single metadata file, using the cache for past days.
+
+    - Past days: return cached file if it exists, otherwise download & cache.
+    - Today: always re-download (don't cache).
     """
-    logger.info(
-        "Downloading & concatenating %d files → %s", len(urls), dest
+    cached = _cache_path_for(filename)
+    today = _is_today(date_str)
+
+    if not today and cached.exists():
+        return cached
+
+    dest = cached if not today else cached.with_suffix(".today.gz")
+    _download_to(url, dest)
+
+    if today:
+        # Don't persist; return temp path that will be used then discarded.
+        return dest
+
+    logger.debug("Cached %s (%d bytes)", cached.name, cached.stat().st_size)
+    return cached
+
+
+def _process_year(base_url: str, year: str) -> list[tuple[str, Path]]:
+    """
+    Process all months in *year*: discover files, download (or read from
+    cache) every metadata file.  Returns ``[(file_type, local_path), …]``.
+
+    Downloads within the year run with up to ``_MAX_CONCURRENT_DOWNLOADS``
+    threads.
+    """
+    year_entries = _fetch_index(f"{base_url}/{year}/index.json")
+    month_dirs = sorted(
+        e["name"].rstrip("/") for e in year_entries if e["name"].endswith("/")
     )
+
+    # Collect (file_type, url, filename, date_str) tuples to download
+    tasks: list[tuple[str, str, str, str]] = []
+    for month in month_dirs:
+        month_entries = _fetch_index(f"{base_url}/{year}/{month}/index.json")
+        month_base = f"{base_url}/{year}/{month}"
+        for entry in month_entries:
+            fname = entry["name"]
+            if not fname.endswith(".jsonl.gz"):
+                continue
+            m = _DATE_RE.match(fname)
+            if not m:
+                continue
+            file_type = fname[len(m.group(0)):].removesuffix(".jsonl.gz")
+            if file_type in _META_TYPES:
+                tasks.append((file_type, f"{month_base}/{fname}", fname, m.group(1)))
+
+    # Separate already-cached (past, file exists) from needing download
+    results: list[tuple[str, Path]] = []
+    to_download: list[tuple[str, str, str, str]] = []
+    for ft, url, fname, date_str in tasks:
+        cached = _cache_path_for(fname)
+        if not _is_today(date_str) and cached.exists():
+            results.append((ft, cached))
+        else:
+            to_download.append((ft, url, fname, date_str))
+
+    if to_download:
+        logger.info(
+            "  %s: %d cached, %d to download",
+            year, len(results), len(to_download),
+        )
+        with ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_DOWNLOADS) as pool:
+            futures = {
+                pool.submit(_download_one_file, url, fname, ds): ft
+                for ft, url, fname, ds in to_download
+            }
+            for future in as_completed(futures):
+                ft = futures[future]
+                path = future.result()
+                results.append((ft, path))
+    else:
+        logger.info("  %s: %d cached, nothing to download", year, len(results))
+
+    return results
+
+
+# ── Merge cached files into final output ─────────────────────────────────
+
+
+def _merge_files(file_paths: list[Path], dest: Path) -> Path:
+    """
+    Concatenate many gzipped JSONL files into a single gzipped JSONL at
+    *dest*.
+    """
+    logger.info("Merging %d files → %s", len(file_paths), dest.name)
     dest.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(dest, "wt", encoding="utf-8") as out:
-        for url in urls:
-            logger.info("  ← %s", url.rsplit("/", 1)[-1])
-            req = urllib.request.Request(url, headers=_HEADERS)  # noqa: S310
-            with urllib.request.urlopen(req) as resp:  # noqa: S310
-                with gzip.open(resp, "rt", encoding="utf-8") as gz:
-                    shutil.copyfileobj(gz, out)
-    logger.info("Concat complete (%d bytes)", dest.stat().st_size)
+        for p in sorted(file_paths):
+            with gzip.open(p, "rt", encoding="utf-8", errors="replace") as gz:
+                shutil.copyfileobj(gz, out)
+    logger.info("Merged %s (%d bytes)", dest.name, dest.stat().st_size)
     return dest
+
+
+# ── Fingerprint + latest-day helpers ─────────────────────────────────────
+
+
+def _discover_latest_fingerprint(base_url: str) -> tuple[str, dict[str, str]]:
+    """
+    Find the latest year → month → day and return
+    ``(latest_date, {file_type: url})`` for that day.
+    """
+    root_entries = _fetch_index(f"{base_url}/index.json")
+    latest_year = _pick_latest_dir(root_entries)
+    year_entries = _fetch_index(f"{base_url}/{latest_year}/index.json")
+    latest_month = _pick_latest_dir(year_entries)
+    month_entries = _fetch_index(
+        f"{base_url}/{latest_year}/{latest_month}/index.json"
+    )
+    files = [e["name"] for e in month_entries if e["name"].endswith(".jsonl.gz")]
+    dates = sorted({m.group(1) for f in files if (m := _DATE_RE.match(f))})
+    if not dates:
+        raise RuntimeError("No dated JSONL files found")
+    latest_date = dates[-1]
+
+    month_base = f"{base_url}/{latest_year}/{latest_month}"
+    prefix = f"{latest_date}-"
+    day_files = {}
+    for f in files:
+        if f.startswith(prefix):
+            ft = f[len(prefix):].removesuffix(".jsonl.gz")
+            day_files[ft] = f"{month_base}/{f}"
+
+    logger.info("Latest dump: %s (%d file types)", latest_date, len(day_files))
+    return latest_date, day_files
 
 
 def _truncate_jsonl_gz(path: Path, max_rows: int) -> None:
@@ -244,51 +270,78 @@ def main() -> None:
     args = parser.parse_args()
 
     DB_DIR.mkdir(parents=True, exist_ok=True)
+    DB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Discover latest month for fingerprints ───────────────────────
-    year, month, entries = _discover_month(ACOUSTID_BASE_URL)
-    day_files, _ = _classify_month_files(
-        ACOUSTID_BASE_URL, year, month, entries,
-    )
-
-    # ── Collect metadata URLs across ALL years/months ────────────────
-    all_meta_urls = _collect_all_metadata_urls(ACOUSTID_BASE_URL)
-
-    # ── Fingerprints (latest day only — large files) ─────────────────
+    # ── 1. Fingerprints (latest day only) ────────────────────────────
+    _, day_files = _discover_latest_fingerprint(ACOUSTID_BASE_URL)
     if "fingerprint-update" not in day_files:
         logger.error("No fingerprint-update file found")
         sys.exit(1)
-    _download(day_files["fingerprint-update"], DB_FINGERPRINT_JSONL)
+    _download_to(day_files["fingerprint-update"], DB_FINGERPRINT_JSONL)
+    logger.info("Fingerprints downloaded (%d bytes)", DB_FINGERPRINT_JSONL.stat().st_size)
     if args.max_rows:
         _truncate_jsonl_gz(DB_FINGERPRINT_JSONL, args.max_rows)
 
-    # ── Track-fingerprint mapping (all history) ──────────────────────
-    if "track_fingerprint-update" not in all_meta_urls:
+    # Optional track-update (latest day)
+    if "track-update" in day_files:
+        _download_to(day_files["track-update"], DB_TRACK_JSONL)
+        if args.max_rows:
+            _truncate_jsonl_gz(DB_TRACK_JSONL, args.max_rows)
+
+    # ── 2. Metadata (all history, cached, concurrent) ────────────────
+    root_entries = _fetch_index(f"{ACOUSTID_BASE_URL}/index.json")
+    year_dirs = sorted(
+        e["name"].rstrip("/") for e in root_entries if e["name"].endswith("/")
+    )
+    logger.info("Processing %d years: %s", len(year_dirs), year_dirs)
+
+    # Process all years concurrently (no limit on year threads)
+    all_results: list[tuple[str, Path]] = []
+    with ThreadPoolExecutor(max_workers=len(year_dirs)) as pool:
+        year_futures = {
+            pool.submit(_process_year, ACOUSTID_BASE_URL, y): y
+            for y in year_dirs
+        }
+        for future in as_completed(year_futures):
+            y = year_futures[future]
+            try:
+                results = future.result()
+                all_results.extend(results)
+                logger.info("Year %s complete: %d files", y, len(results))
+            except Exception:
+                logger.exception("Failed to process year %s", y)
+
+    # Group by file type
+    by_type: dict[str, list[Path]] = {}
+    for ft, path in all_results:
+        by_type.setdefault(ft, []).append(path)
+
+    for ft, paths in by_type.items():
+        logger.info("  %s: %d files total", ft, len(paths))
+
+    # ── 3. Merge into final output files ─────────────────────────────
+    if "track_fingerprint-update" not in by_type:
         logger.error("No track_fingerprint-update files found")
         sys.exit(1)
-    _download_and_concat(all_meta_urls["track_fingerprint-update"], DB_TRACK_FP_JSONL)
+    _merge_files(by_type["track_fingerprint-update"], DB_TRACK_FP_JSONL)
     if args.max_rows:
         _truncate_jsonl_gz(DB_TRACK_FP_JSONL, args.max_rows)
 
-    # ── Track→meta mapping (all history) ─────────────────────────────
-    if "track_meta-update" in all_meta_urls:
-        _download_and_concat(all_meta_urls["track_meta-update"], DB_TRACK_META_JSONL)
+    if "track_meta-update" in by_type:
+        _merge_files(by_type["track_meta-update"], DB_TRACK_META_JSONL)
         if args.max_rows:
             _truncate_jsonl_gz(DB_TRACK_META_JSONL, args.max_rows)
 
-    # ── Meta: title / artist / album (all history) ───────────────────
-    if "meta-update" not in all_meta_urls:
+    if "meta-update" not in by_type:
         logger.error("No meta-update files found")
         sys.exit(1)
-    _download_and_concat(all_meta_urls["meta-update"], DB_META_JSONL)
+    _merge_files(by_type["meta-update"], DB_META_JSONL)
     if args.max_rows:
         _truncate_jsonl_gz(DB_META_JSONL, args.max_rows)
 
-    # ── Track records (latest day only, optional) ────────────────────
-    if "track-update" in day_files:
-        _download(day_files["track-update"], DB_TRACK_JSONL)
-        if args.max_rows:
-            _truncate_jsonl_gz(DB_TRACK_JSONL, args.max_rows)
+    # ── Clean up today's temp files ──────────────────────────────────
+    for p in DB_CACHE_DIR.glob("*.today.gz"):
+        p.unlink(missing_ok=True)
 
     logger.info("Database download complete.  Files in %s", DB_DIR)
 

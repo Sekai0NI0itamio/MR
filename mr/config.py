@@ -20,6 +20,7 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 DEBUG_DIR = PROJECT_ROOT / "debug"
 
 DB_DIR = PROJECT_ROOT / "db"
+DB_CACHE_DIR = DB_DIR / "cache"
 DB_FINGERPRINT_CSV = DB_DIR / "fingerprints.csv"
 DB_TRACK_CSV = DB_DIR / "tracks.csv"
 FAISS_INDEX_PATH = DB_DIR / "fingerprints.index"
@@ -60,5 +61,5 @@ FAISS_NLIST = 256              # number of IVF clusters (tuned at build time)
 
 def ensure_dirs() -> None:
     """Create all output directories if they don't already exist."""
-    for d in (INCOMING_DIR, RESULTS_DIR, LOGS_DIR, DEBUG_DIR, DB_DIR):
+    for d in (INCOMING_DIR, RESULTS_DIR, LOGS_DIR, DEBUG_DIR, DB_DIR, DB_CACHE_DIR):
         d.mkdir(parents=True, exist_ok=True)
