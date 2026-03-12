@@ -38,15 +38,16 @@ HIGH_CONFIDENCE_THRESHOLD = float(os.environ.get("MR_HIGH_CONF", "0.5"))
 # ── Parallelism ──────────────────────────────────────────────────────────
 MAX_WORKERS = int(os.environ.get("MR_MAX_WORKERS", "4"))
 
-# ── AcoustID database download URLs ─────────────────────────────────────
-ACOUSTID_FINGERPRINT_URL = os.environ.get(
-    "MR_FP_URL",
-    "https://data.acoustid.org/dumps/acoustid-fingerprint-latest.csv.gz",
+# ── AcoustID data directory ──────────────────────────────────────────────
+ACOUSTID_BASE_URL = os.environ.get(
+    "MR_ACOUSTID_BASE_URL",
+    "https://data.acoustid.org",
 )
-ACOUSTID_TRACK_URL = os.environ.get(
-    "MR_TRACK_URL",
-    "https://data.acoustid.org/dumps/acoustid-track-latest.csv.gz",
-)
+
+# Local paths for downloaded JSONL dump files
+DB_FINGERPRINT_JSONL = DB_DIR / "fingerprints.jsonl.gz"
+DB_TRACK_JSONL = DB_DIR / "tracks.jsonl.gz"
+DB_TRACK_META_JSONL = DB_DIR / "track_meta.jsonl.gz"
 
 # ── FAISS index parameters ───────────────────────────────────────────────
 FINGERPRINT_DIM = 120          # number of int32 sub-fingerprints kept per track

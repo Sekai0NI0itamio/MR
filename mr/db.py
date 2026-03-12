@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import json
 import logging
 import pickle
 from pathlib import Path
@@ -27,7 +28,10 @@ import numpy as np
 from mr.config import (
     DB_DIR,
     DB_FINGERPRINT_CSV,
+    DB_FINGERPRINT_JSONL,
     DB_TRACK_CSV,
+    DB_TRACK_JSONL,
+    DB_TRACK_META_JSONL,
     FAISS_INDEX_PATH,
     FAISS_NLIST,
     FINGERPRINT_DIM,
@@ -66,28 +70,66 @@ def fingerprint_to_vector(raw_fp: List[int], dim: int = FINGERPRINT_DIM) -> np.n
     return arr
 
 
-# ── CSV parsing ───────────────────────────────────────────────────────────
+# ── Data parsing (CSV + JSONL) ────────────────────────────────────────────
+
+
+def _detect_fingerprint_path() -> Path:
+    """Return the first existing fingerprint file (JSONL preferred)."""
+    if DB_FINGERPRINT_JSONL.exists():
+        return DB_FINGERPRINT_JSONL
+    return DB_FINGERPRINT_CSV
+
+
+def _detect_track_path() -> Path:
+    """Return the first existing track-metadata file (JSONL preferred)."""
+    if DB_TRACK_META_JSONL.exists():
+        return DB_TRACK_META_JSONL
+    if DB_TRACK_JSONL.exists():
+        return DB_TRACK_JSONL
+    return DB_TRACK_CSV
+
+
+def _is_jsonl(path: Path) -> bool:
+    name = path.name
+    return name.endswith(".jsonl") or name.endswith(".jsonl.gz")
+
+
+def _open_file(path: Path):
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "r", encoding="utf-8", errors="replace")
 
 
 def parse_tracks_csv(path: Path | None = None) -> Dict[str, dict]:
     """
-    Parse the AcoustID ``track*.csv(.gz)`` into a mapping
-    ``{track_id: {"title": ..., "artist": ..., "album": ...}}``.
+    Parse an AcoustID track-metadata file (CSV or JSONL, optionally gzipped)
+    into a mapping ``{track_id: {"title": ..., "artist": ..., "album": ...}}``.
     """
-    path = path or DB_TRACK_CSV
+    path = path or _detect_track_path()
     logger.info("Parsing track metadata from %s", path)
 
     tracks: Dict[str, dict] = {}
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            tid = row.get("id") or row.get("track_id", "")
-            tracks[tid] = {
-                "title": row.get("title", "Unknown"),
-                "artist": row.get("artist", "Unknown"),
-                "album": row.get("album", "Unknown"),
-            }
+
+    if _is_jsonl(path):
+        with _open_file(path) as fh:
+            for line in fh:
+                row = json.loads(line)
+                tid = str(row.get("id") or row.get("track_id", ""))
+                tracks[tid] = {
+                    "title": row.get("title", "Unknown"),
+                    "artist": row.get("artist", "Unknown"),
+                    "album": row.get("album", "Unknown"),
+                }
+    else:
+        with _open_file(path) as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                tid = row.get("id") or row.get("track_id", "")
+                tracks[tid] = {
+                    "title": row.get("title", "Unknown"),
+                    "artist": row.get("artist", "Unknown"),
+                    "album": row.get("album", "Unknown"),
+                }
     logger.info("Loaded %d track metadata entries", len(tracks))
     return tracks
 
@@ -98,33 +140,49 @@ def load_fingerprints_csv(
     max_rows: int | None = None,
 ) -> Tuple[np.ndarray, List[str]]:
     """
-    Parse the AcoustID fingerprint CSV and return:
+    Parse an AcoustID fingerprint file (CSV or JSONL, optionally gzipped)
+    and return:
       - ``vectors``: float32 array of shape ``(N, dim)``
       - ``track_ids``: list of corresponding track IDs (length N)
 
     If *max_rows* is set, only the first *max_rows* entries are loaded
     (useful for testing or memory-constrained environments).
     """
-    path = path or DB_FINGERPRINT_CSV
+    path = path or _detect_fingerprint_path()
     logger.info("Loading fingerprints from %s (dim=%d)", path, dim)
 
     vectors: list[np.ndarray] = []
     track_ids: list[str] = []
 
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
-        reader = csv.DictReader(fh)
-        for i, row in enumerate(reader):
-            if max_rows is not None and i >= max_rows:
-                break
-            tid = row.get("track_id") or row.get("id", "")
-            raw_str = row.get("fingerprint", "")
-            if not raw_str:
-                continue
-            raw_ints = [int(x) for x in raw_str.split(",") if x.strip()]
-            vec = fingerprint_to_vector(raw_ints, dim)
-            vectors.append(vec)
-            track_ids.append(tid)
+    if _is_jsonl(path):
+        with _open_file(path) as fh:
+            for i, line in enumerate(fh):
+                if max_rows is not None and i >= max_rows:
+                    break
+                row = json.loads(line)
+                tid = str(row.get("track_id") or row.get("id", ""))
+                raw = row.get("fingerprint", [])
+                if isinstance(raw, str):
+                    raw = [int(x) for x in raw.split(",") if x.strip()]
+                if not raw:
+                    continue
+                vec = fingerprint_to_vector(raw, dim)
+                vectors.append(vec)
+                track_ids.append(tid)
+    else:
+        with _open_file(path) as fh:
+            reader = csv.DictReader(fh)
+            for i, row in enumerate(reader):
+                if max_rows is not None and i >= max_rows:
+                    break
+                tid = row.get("track_id") or row.get("id", "")
+                raw_str = row.get("fingerprint", "")
+                if not raw_str:
+                    continue
+                raw_ints = [int(x) for x in raw_str.split(",") if x.strip()]
+                vec = fingerprint_to_vector(raw_ints, dim)
+                vectors.append(vec)
+                track_ids.append(tid)
 
     mat = np.vstack(vectors).astype(np.float32) if vectors else np.empty((0, dim), dtype=np.float32)
     logger.info("Loaded %d fingerprint vectors (%s)", mat.shape[0], mat.shape)

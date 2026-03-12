@@ -29,6 +29,9 @@ def _isolate_project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cfg, "DB_DIR", tmp_path / "db")
     monkeypatch.setattr(cfg, "DB_FINGERPRINT_CSV", tmp_path / "db" / "fingerprints.csv")
     monkeypatch.setattr(cfg, "DB_TRACK_CSV", tmp_path / "db" / "tracks.csv")
+    monkeypatch.setattr(cfg, "DB_FINGERPRINT_JSONL", tmp_path / "db" / "fingerprints.jsonl.gz")
+    monkeypatch.setattr(cfg, "DB_TRACK_JSONL", tmp_path / "db" / "tracks.jsonl.gz")
+    monkeypatch.setattr(cfg, "DB_TRACK_META_JSONL", tmp_path / "db" / "track_meta.jsonl.gz")
     monkeypatch.setattr(cfg, "FAISS_INDEX_PATH", tmp_path / "db" / "fingerprints.index")
     monkeypatch.setattr(cfg, "TRACK_METADATA_PATH", tmp_path / "db" / "track_metadata.pkl")
 
