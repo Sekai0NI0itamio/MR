@@ -3,8 +3,8 @@
 Download the AcoustID database dumps (fingerprints + track metadata).
 
 This script:
-  1. Crawls https://data.acoustid.org via ``index.json`` across **all**
-     years and months.
+  1. Crawls https://data.acoustid.org via ``index.json`` for the
+     configured year range (default: last 5 years).
   2. Downloads metadata files (``meta-update``, ``track_meta-update``,
      ``track_fingerprint-update``) for every day, **caching** past days
      locally so they are only downloaded once.  The current day is always
@@ -18,7 +18,7 @@ Concurrency:
   - Within each year, up to 50 file downloads run concurrently.
 
 Usage:
-    python scripts/download_db.py [--max-rows N]
+    python scripts/download_db.py [--max-rows N] [--year-start Y] [--year-end Y]
 """
 
 from __future__ import annotations
@@ -216,22 +216,24 @@ def _process_year(base_url: str, year: str) -> list[tuple[str, Path]]:
 
 def _merge_files(file_paths: list[Path], dest: Path) -> Path:
     """
-    Concatenate many gzipped JSONL files into a single gzipped JSONL at
-    *dest*.
+    Concatenate many gzipped JSONL files by appending raw bytes.
+
+    The gzip format natively supports concatenated streams, so we skip
+    the expensive decompress→recompress cycle entirely.
     """
     logger.info("Merging %d files → %s", len(file_paths), dest.name)
     dest.parent.mkdir(parents=True, exist_ok=True)
     skipped = 0
-    with gzip.open(dest, "wt", encoding="utf-8") as out:
+    with open(dest, "wb") as out:
         for p in sorted(file_paths):
             try:
-                with gzip.open(p, "rt", encoding="utf-8", errors="replace") as gz:
-                    shutil.copyfileobj(gz, out)
-            except (EOFError, gzip.BadGzipFile, OSError) as exc:
-                logger.warning("Skipping corrupt file %s: %s", p.name, exc)
+                with open(p, "rb") as f_in:
+                    shutil.copyfileobj(f_in, out)
+            except OSError as exc:
+                logger.warning("Skipping unreadable file %s: %s", p.name, exc)
                 skipped += 1
     if skipped:
-        logger.warning("Skipped %d corrupt files during merge", skipped)
+        logger.warning("Skipped %d unreadable files during merge", skipped)
     logger.info("Merged %s (%d bytes)", dest.name, dest.stat().st_size)
     return dest
 
@@ -287,6 +289,14 @@ def _truncate_jsonl_gz(path: Path, max_rows: int) -> None:
 # ── Main ─────────────────────────────────────────────────────────────────
 
 
+def _default_year_start() -> int:
+    return datetime.datetime.now(datetime.timezone.utc).year - 5
+
+
+def _default_year_end() -> int:
+    return datetime.datetime.now(datetime.timezone.utc).year
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download AcoustID database dumps.")
     parser.add_argument(
@@ -294,6 +304,18 @@ def main() -> None:
         type=int,
         default=None,
         help="Truncate each file to this many data rows (for testing).",
+    )
+    parser.add_argument(
+        "--year-start",
+        type=int,
+        default=_default_year_start(),
+        help="First year of metadata to download (default: current year - 5).",
+    )
+    parser.add_argument(
+        "--year-end",
+        type=int,
+        default=_default_year_end(),
+        help="Last year of metadata to download (default: current year).",
     )
     args = parser.parse_args()
 
@@ -316,12 +338,19 @@ def main() -> None:
         if args.max_rows:
             _truncate_jsonl_gz(DB_TRACK_JSONL, args.max_rows)
 
-    # ── 2. Metadata (all history, cached, concurrent) ────────────────
+    # ── 2. Metadata (year range, cached, concurrent) ────────────────
     root_entries = _fetch_index(f"{ACOUSTID_BASE_URL}/index.json")
     year_dirs = sorted(
         e["name"].rstrip("/") for e in root_entries if e["name"].endswith("/")
     )
-    logger.info("Processing %d years: %s", len(year_dirs), year_dirs)
+    year_dirs = [
+        y for y in year_dirs
+        if y.isdigit() and args.year_start <= int(y) <= args.year_end
+    ]
+    logger.info(
+        "Processing %d years (%d–%d): %s",
+        len(year_dirs), args.year_start, args.year_end, year_dirs,
+    )
 
     # Process all years concurrently (no limit on year threads)
     all_results: list[tuple[str, Path]] = []
