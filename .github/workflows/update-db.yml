@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────────────────
+# MR – Music Recognizer · Database Update Workflow (scheduled)
+# ─────────────────────────────────────────────────────────────────────────
+# Rebuilds the AcoustID database index on a weekly schedule so the
+# cached index stays reasonably up-to-date with upstream data.
+# Can also be triggered manually.
+# ─────────────────────────────────────────────────────────────────────────
+
+name: "🔄 Update Database"
+
+on:
+  schedule:
+    - cron: "0 4 * * 0"   # Every Sunday at 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  update-db:
+    name: "Download & rebuild index"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download latest AcoustID data
+        run: python scripts/download_db.py
+        env:
+          MR_PROJECT_ROOT: ${{ github.workspace }}
+
+      - name: Build FAISS index
+        run: python scripts/build_index.py
+        env:
+          MR_PROJECT_ROOT: ${{ github.workspace }}
+
+      # Save the new index to cache (overwrites previous)
+      - name: Save database cache
+        uses: actions/cache/save@v4
+        with:
+          path: db/
+          key: mr-db-v1-${{ hashFiles('scripts/download_db.py', 'scripts/build_index.py') }}-${{ github.run_id }}

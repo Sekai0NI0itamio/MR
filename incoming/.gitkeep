@@ -1,0 +1,2 @@
+# Place audio files (.mp3, .m4a, .ogg) in this directory
+# then trigger the "Recognize Music" workflow from GitHub Actions.

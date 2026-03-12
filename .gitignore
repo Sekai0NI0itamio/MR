@@ -1,0 +1,36 @@
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments ─────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── IDE / editor ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── MR runtime artifacts (generated, not committed) ─────────────────────
+results/
+logs/
+debug/
+
+# ── Database (large, cached via GitHub Actions) ─────────────────────────
+db/
+
+# ── Temporary files ──────────────────────────────────────────────────────
+*.tmp
+*.bak

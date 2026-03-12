@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────
+# MR – Music Recognizer · CI / Test Workflow
+# ─────────────────────────────────────────────────────────────────────────
+# Runs unit tests on every push and pull request.
+# ─────────────────────────────────────────────────────────────────────────
+
+name: "🧪 CI Tests"
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "incoming/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "incoming/**"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: "Unit tests (Python ${{ matrix.python-version }})"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short
+        env:
+          MR_PROJECT_ROOT: ${{ github.workspace }}

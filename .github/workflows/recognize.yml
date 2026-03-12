@@ -1,0 +1,110 @@
+# ─────────────────────────────────────────────────────────────────────────
+# MR – Music Recognizer · Main Recognition Workflow
+# ─────────────────────────────────────────────────────────────────────────
+# Triggered manually via workflow_dispatch.  Users place audio files in
+# incoming/ and click "Run workflow" to get the top-20 matching tracks.
+# ─────────────────────────────────────────────────────────────────────────
+
+name: "🎵 Recognize Music"
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_workers:
+        description: "Number of parallel workers"
+        required: false
+        default: "4"
+        type: string
+      rebuild_index:
+        description: "Force re-download and rebuild the database index"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  recognize:
+    name: "Recognize audio files"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 3. System dependencies ─────────────────────────────────────
+      - name: Install ffmpeg and fpcalc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg libchromaprint-tools
+
+      # ── 4. Restore cached database / index ─────────────────────────
+      - name: Restore database cache
+        id: db-cache
+        uses: actions/cache@v4
+        with:
+          path: db/
+          key: mr-db-v1-${{ hashFiles('scripts/download_db.py', 'scripts/build_index.py') }}
+          restore-keys: |
+            mr-db-v1-
+
+      # ── 5. Download & build database (if not cached) ───────────────
+      - name: Download AcoustID database
+        if: steps.db-cache.outputs.cache-hit != 'true' || inputs.rebuild_index == 'true'
+        run: python scripts/download_db.py
+        env:
+          MR_PROJECT_ROOT: ${{ github.workspace }}
+
+      - name: Build FAISS index
+        if: steps.db-cache.outputs.cache-hit != 'true' || inputs.rebuild_index == 'true'
+        run: python scripts/build_index.py
+        env:
+          MR_PROJECT_ROOT: ${{ github.workspace }}
+
+      # ── 6. Verify incoming files ───────────────────────────────────
+      - name: Check for audio files
+        id: check-files
+        run: |
+          count=$(find incoming/ -maxdepth 1 -type f \( -name '*.mp3' -o -name '*.m4a' -o -name '*.ogg' \) 2>/dev/null | wc -l)
+          echo "file_count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "::warning::No audio files found in incoming/. Add .mp3, .m4a, or .ogg files and re-run."
+          else
+            echo "Found $count audio file(s) to process."
+          fi
+
+      # ── 7. Run recognition pipeline ───────────────────────────────
+      - name: Run recognition pipeline
+        if: steps.check-files.outputs.file_count != '0'
+        run: python -m mr
+        env:
+          MR_PROJECT_ROOT: ${{ github.workspace }}
+          MR_MAX_WORKERS: ${{ inputs.max_workers }}
+        continue-on-error: true
+
+      # ── 8. Upload artifacts ────────────────────────────────────────
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mr-results
+          path: |
+            results/
+            logs/
+            debug/
+          if-no-files-found: warn
+          retention-days: 30
