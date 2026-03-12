@@ -91,6 +91,52 @@ def _discover_month(base_url: str) -> tuple[str, str, list[dict]]:
     return latest_year, latest_month, month_entries
 
 
+def _collect_all_metadata_urls(base_url: str) -> dict[str, list[str]]:
+    """
+    Walk **every** year / month directory and collect URLs for the small
+    metadata file types (``meta-update``, ``track_meta-update``,
+    ``track_fingerprint-update``).
+
+    Returns ``{file_type: [url, …]}`` across *all* available history.
+    """
+    date_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})-")
+    all_urls: dict[str, list[str]] = {}
+
+    root_entries = _fetch_index(f"{base_url}/index.json")
+    year_dirs = sorted(
+        e["name"].rstrip("/") for e in root_entries if e["name"].endswith("/")
+    )
+    logger.info("Scanning %d years for metadata: %s", len(year_dirs), year_dirs)
+
+    for year in year_dirs:
+        year_entries = _fetch_index(f"{base_url}/{year}/index.json")
+        month_dirs = sorted(
+            e["name"].rstrip("/") for e in year_entries if e["name"].endswith("/")
+        )
+        for month in month_dirs:
+            logger.info("  Indexing %s/%s …", year, month)
+            month_entries = _fetch_index(
+                f"{base_url}/{year}/{month}/index.json"
+            )
+            month_base = f"{base_url}/{year}/{month}"
+            for entry in month_entries:
+                fname = entry["name"]
+                if not fname.endswith(".jsonl.gz"):
+                    continue
+                m = date_pattern.match(fname)
+                if not m:
+                    continue
+                file_type = fname[len(m.group(0)):].removesuffix(".jsonl.gz")
+                if file_type in _MONTH_WIDE_TYPES:
+                    all_urls.setdefault(file_type, []).append(
+                        f"{month_base}/{fname}"
+                    )
+
+    for ft, urls in all_urls.items():
+        logger.info("  %s: %d files", ft, len(urls))
+    return all_urls
+
+
 def _classify_month_files(
     base_url: str,
     year: str,
@@ -199,11 +245,14 @@ def main() -> None:
 
     DB_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Discover latest month & classify files ───────────────────────
+    # ── Discover latest month for fingerprints ───────────────────────
     year, month, entries = _discover_month(ACOUSTID_BASE_URL)
-    day_files, month_files = _classify_month_files(
+    day_files, _ = _classify_month_files(
         ACOUSTID_BASE_URL, year, month, entries,
     )
+
+    # ── Collect metadata URLs across ALL years/months ────────────────
+    all_meta_urls = _collect_all_metadata_urls(ACOUSTID_BASE_URL)
 
     # ── Fingerprints (latest day only — large files) ─────────────────
     if "fingerprint-update" not in day_files:
@@ -213,25 +262,25 @@ def main() -> None:
     if args.max_rows:
         _truncate_jsonl_gz(DB_FINGERPRINT_JSONL, args.max_rows)
 
-    # ── Track-fingerprint mapping (full month) ───────────────────────
-    if "track_fingerprint-update" not in month_files:
+    # ── Track-fingerprint mapping (all history) ──────────────────────
+    if "track_fingerprint-update" not in all_meta_urls:
         logger.error("No track_fingerprint-update files found")
         sys.exit(1)
-    _download_and_concat(month_files["track_fingerprint-update"], DB_TRACK_FP_JSONL)
+    _download_and_concat(all_meta_urls["track_fingerprint-update"], DB_TRACK_FP_JSONL)
     if args.max_rows:
         _truncate_jsonl_gz(DB_TRACK_FP_JSONL, args.max_rows)
 
-    # ── Track→meta mapping (full month) ──────────────────────────────
-    if "track_meta-update" in month_files:
-        _download_and_concat(month_files["track_meta-update"], DB_TRACK_META_JSONL)
+    # ── Track→meta mapping (all history) ─────────────────────────────
+    if "track_meta-update" in all_meta_urls:
+        _download_and_concat(all_meta_urls["track_meta-update"], DB_TRACK_META_JSONL)
         if args.max_rows:
             _truncate_jsonl_gz(DB_TRACK_META_JSONL, args.max_rows)
 
-    # ── Meta (title / artist / album — full month) ───────────────────
-    if "meta-update" not in month_files:
+    # ── Meta: title / artist / album (all history) ───────────────────
+    if "meta-update" not in all_meta_urls:
         logger.error("No meta-update files found")
         sys.exit(1)
-    _download_and_concat(month_files["meta-update"], DB_META_JSONL)
+    _download_and_concat(all_meta_urls["meta-update"], DB_META_JSONL)
     if args.max_rows:
         _truncate_jsonl_gz(DB_META_JSONL, args.max_rows)
 
