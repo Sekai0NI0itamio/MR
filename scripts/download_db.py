@@ -50,7 +50,9 @@ def _download(url: str, dest: Path) -> Path:
     """Download *url* to *dest*, showing progress."""
     logger.info("Downloading %s → %s", url, dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(url, dest)  # noqa: S310 – trusted URL from config
+    req = urllib.request.Request(url, headers={"User-Agent": "MR/1.0"})  # noqa: S310
+    with urllib.request.urlopen(req) as resp, open(dest, "wb") as f_out:  # noqa: S310
+        shutil.copyfileobj(resp, f_out)
     logger.info("Download complete (%d bytes)", dest.stat().st_size)
     return dest
 
