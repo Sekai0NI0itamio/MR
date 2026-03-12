@@ -95,12 +95,26 @@ def _is_today(date_str: str) -> bool:
     return date_str == datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
-def _download_to(url: str, dest: Path) -> Path:
+def _is_valid_gz(path: Path) -> bool:
+    """Return True if *path* is a valid gzip file we can fully read."""
+    try:
+        with gzip.open(path, "rb") as f:
+            while f.read(65536):
+                pass
+        return True
+    except (EOFError, gzip.BadGzipFile, OSError):
+        return False
+
+
+def _download_to(url: str, dest: Path, *, validate: bool = False) -> Path:
     """Download *url* → *dest* (raw bytes, no decompression)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url, headers=_HEADERS)  # noqa: S310
     with urllib.request.urlopen(req) as resp, open(dest, "wb") as f_out:  # noqa: S310
         shutil.copyfileobj(resp, f_out)
+    if validate and not _is_valid_gz(dest):
+        dest.unlink(missing_ok=True)
+        raise OSError(f"Downloaded file is corrupt: {dest}")
     return dest
 
 
@@ -118,10 +132,17 @@ def _download_one_file(url: str, filename: str, date_str: str) -> Path:
     today = _is_today(date_str)
 
     if not today and cached.exists():
-        return cached
+        if _is_valid_gz(cached):
+            return cached
+        logger.warning("Corrupt cache file %s — re-downloading", cached.name)
+        cached.unlink(missing_ok=True)
 
     dest = cached if not today else cached.with_suffix(".today.gz")
-    _download_to(url, dest)
+    try:
+        _download_to(url, dest, validate=True)
+    except OSError:
+        logger.warning("Download corrupt, retrying once: %s", filename)
+        _download_to(url, dest, validate=True)
 
     if today:
         # Don't persist; return temp path that will be used then discarded.
@@ -200,10 +221,17 @@ def _merge_files(file_paths: list[Path], dest: Path) -> Path:
     """
     logger.info("Merging %d files → %s", len(file_paths), dest.name)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    skipped = 0
     with gzip.open(dest, "wt", encoding="utf-8") as out:
         for p in sorted(file_paths):
-            with gzip.open(p, "rt", encoding="utf-8", errors="replace") as gz:
-                shutil.copyfileobj(gz, out)
+            try:
+                with gzip.open(p, "rt", encoding="utf-8", errors="replace") as gz:
+                    shutil.copyfileobj(gz, out)
+            except (EOFError, gzip.BadGzipFile, OSError) as exc:
+                logger.warning("Skipping corrupt file %s: %s", p.name, exc)
+                skipped += 1
+    if skipped:
+        logger.warning("Skipped %d corrupt files during merge", skipped)
     logger.info("Merged %s (%d bytes)", dest.name, dest.stat().st_size)
     return dest
 
