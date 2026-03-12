@@ -277,10 +277,16 @@ def _merge_dedup(
             logger.warning("Skipping corrupt file %s: %s", p.name, exc)
             skipped_files += 1
     logger.info("Deduped to %d unique records", len(records))
-    with gzip.open(dest, "wt", encoding="utf-8") as out:
+    with gzip.open(dest, "wb", compresslevel=1) as out:
+        buf: list[str] = []
         for line in records.values():
-            out.write(line)
-            out.write("\n")
+            buf.append(line)
+            buf.append("\n")
+            if len(buf) >= 20000:
+                out.write("".join(buf).encode("utf-8"))
+                buf.clear()
+        if buf:
+            out.write("".join(buf).encode("utf-8"))
     logger.info("Wrote %s (%d bytes)", dest.name, dest.stat().st_size)
     return dest
 
@@ -318,10 +324,16 @@ def _merge_dedup_composite(
             logger.warning("Skipping corrupt file %s: %s", p.name, exc)
             skipped_files += 1
     logger.info("Deduped to %d unique records", len(records))
-    with gzip.open(dest, "wt", encoding="utf-8") as out:
+    with gzip.open(dest, "wb", compresslevel=1) as out:
+        buf: list[str] = []
         for line in records.values():
-            out.write(line)
-            out.write("\n")
+            buf.append(line)
+            buf.append("\n")
+            if len(buf) >= 20000:
+                out.write("".join(buf).encode("utf-8"))
+                buf.clear()
+        if buf:
+            out.write("".join(buf).encode("utf-8"))
     logger.info("Wrote %s (%d bytes)", dest.name, dest.stat().st_size)
     return dest
 
@@ -378,7 +390,7 @@ def _truncate_jsonl_gz(path: Path, max_rows: int) -> None:
 
 
 def _default_year_start() -> int:
-    return datetime.datetime.now(datetime.timezone.utc).year - 5
+    return datetime.datetime.now(datetime.timezone.utc).year - 2
 
 
 def _default_year_end() -> int:
@@ -397,7 +409,7 @@ def main() -> None:
         "--year-start",
         type=int,
         default=_default_year_start(),
-        help="First year of metadata to download (default: current year - 5).",
+        help="First year of metadata to download (default: current year - 2).",
     )
     parser.add_argument(
         "--year-end",
