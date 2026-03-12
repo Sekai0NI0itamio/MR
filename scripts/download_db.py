@@ -223,12 +223,16 @@ def _merge_files(file_paths: list[Path], dest: Path) -> Path:
     """
     logger.info("Merging %d files → %s", len(file_paths), dest.name)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # A tiny gzip stream that decompresses to a single newline – appended
+    # after each file to prevent line-fusion at stream boundaries.
+    gz_newline = gzip.compress(b"\n")
     skipped = 0
     with open(dest, "wb") as out:
         for p in sorted(file_paths):
             try:
                 with open(p, "rb") as f_in:
                     shutil.copyfileobj(f_in, out)
+                out.write(gz_newline)
             except OSError as exc:
                 logger.warning("Skipping unreadable file %s: %s", p.name, exc)
                 skipped += 1

@@ -86,6 +86,19 @@ def _open_file(path: Path):
     return open(path, "r", encoding="utf-8", errors="replace")
 
 
+def _iter_jsonl(path: Path):
+    """Yield parsed JSON objects from a JSONL(.gz) file, skipping bad lines."""
+    with _open_file(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+
 def _use_jsonl_data() -> bool:
     """Return True if the new JSONL dump files are present."""
     return DB_FINGERPRINT_JSONL.exists() and DB_META_JSONL.exists()
@@ -94,15 +107,13 @@ def _use_jsonl_data() -> bool:
 def _load_meta_jsonl() -> Dict[str, dict]:
     """Parse ``meta-update.jsonl.gz`` → ``{meta_id: {title, artist, album}}``."""
     meta: Dict[str, dict] = {}
-    with _open_file(DB_META_JSONL) as fh:
-        for line in fh:
-            row = json.loads(line)
-            mid = str(row["id"])
-            meta[mid] = {
-                "title": row.get("track", "Unknown"),
-                "artist": row.get("artist", "Unknown"),
-                "album": row.get("album", "Unknown"),
-            }
+    for row in _iter_jsonl(DB_META_JSONL):
+        mid = str(row["id"])
+        meta[mid] = {
+            "title": row.get("track", "Unknown"),
+            "artist": row.get("artist", "Unknown"),
+            "album": row.get("album", "Unknown"),
+        }
     logger.info("Loaded %d meta entries from %s", len(meta), DB_META_JSONL.name)
     return meta
 
@@ -114,15 +125,13 @@ def _load_track_meta_jsonl() -> Dict[str, str]:
     highest ``submission_count`` wins.
     """
     best: Dict[str, tuple[int, str]] = {}  # track_id → (submission_count, meta_id)
-    with _open_file(DB_TRACK_META_JSONL) as fh:
-        for line in fh:
-            row = json.loads(line)
-            tid = str(row["track_id"])
-            mid = str(row["meta_id"])
-            cnt = int(row.get("submission_count", 0))
-            prev = best.get(tid)
-            if prev is None or cnt > prev[0]:
-                best[tid] = (cnt, mid)
+    for row in _iter_jsonl(DB_TRACK_META_JSONL):
+        tid = str(row["track_id"])
+        mid = str(row["meta_id"])
+        cnt = int(row.get("submission_count", 0))
+        prev = best.get(tid)
+        if prev is None or cnt > prev[0]:
+            best[tid] = (cnt, mid)
     mapping = {tid: mid for tid, (_, mid) in best.items()}
     logger.info("Loaded %d track→meta mappings from %s", len(mapping), DB_TRACK_META_JSONL.name)
     return mapping
@@ -131,12 +140,10 @@ def _load_track_meta_jsonl() -> Dict[str, str]:
 def _load_track_fingerprint_jsonl() -> Dict[str, str]:
     """Parse ``track_fingerprint-update.jsonl.gz`` → ``{fingerprint_id: track_id}``."""
     mapping: Dict[str, str] = {}
-    with _open_file(DB_TRACK_FP_JSONL) as fh:
-        for line in fh:
-            row = json.loads(line)
-            fid = str(row["fingerprint_id"])
-            tid = str(row["track_id"])
-            mapping[fid] = tid
+    for row in _iter_jsonl(DB_TRACK_FP_JSONL):
+        fid = str(row["fingerprint_id"])
+        tid = str(row["track_id"])
+        mapping[fid] = tid
     logger.info("Loaded %d fingerprint→track mappings from %s", len(mapping), DB_TRACK_FP_JSONL.name)
     return mapping
 
@@ -211,23 +218,21 @@ def load_fingerprints_csv(
 
         vectors: list[np.ndarray] = []
         track_ids: list[str] = []
-        with _open_file(DB_FINGERPRINT_JSONL) as fh:
-            for i, line in enumerate(fh):
-                if max_rows is not None and i >= max_rows:
-                    break
-                row = json.loads(line)
-                fid = str(row["id"])
-                tid = fp_to_track.get(fid)
-                if tid is None:
-                    continue
-                raw = row.get("fingerprint", [])
-                if isinstance(raw, str):
-                    raw = [int(x) for x in raw.split(",") if x.strip()]
-                if not raw:
-                    continue
-                vec = fingerprint_to_vector(raw, dim)
-                vectors.append(vec)
-                track_ids.append(tid)
+        for i, row in enumerate(_iter_jsonl(DB_FINGERPRINT_JSONL)):
+            if max_rows is not None and i >= max_rows:
+                break
+            fid = str(row["id"])
+            tid = fp_to_track.get(fid)
+            if tid is None:
+                continue
+            raw = row.get("fingerprint", [])
+            if isinstance(raw, str):
+                raw = [int(x) for x in raw.split(",") if x.strip()]
+            if not raw:
+                continue
+            vec = fingerprint_to_vector(raw, dim)
+            vectors.append(vec)
+            track_ids.append(tid)
 
         mat = np.vstack(vectors).astype(np.float32) if vectors else np.empty((0, dim), dtype=np.float32)
         logger.info("Loaded %d fingerprint vectors (%s)", mat.shape[0], mat.shape)
