@@ -223,8 +223,6 @@ def _merge_files(file_paths: list[Path], dest: Path) -> Path:
     """
     logger.info("Merging %d files → %s", len(file_paths), dest.name)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # A tiny gzip stream that decompresses to a single newline – appended
-    # after each file to prevent line-fusion at stream boundaries.
     gz_newline = gzip.compress(b"\n")
     skipped = 0
     with open(dest, "wb") as out:
@@ -239,6 +237,92 @@ def _merge_files(file_paths: list[Path], dest: Path) -> Path:
     if skipped:
         logger.warning("Skipped %d unreadable files during merge", skipped)
     logger.info("Merged %s (%d bytes)", dest.name, dest.stat().st_size)
+    return dest
+
+
+def _merge_dedup(
+    file_paths: list[Path],
+    dest: Path,
+    key_field: str,
+) -> Path:
+    """
+    Merge many gzipped JSONL files into *dest*, deduplicating by
+    *key_field*.  Later entries (by sorted filename / date) overwrite
+    earlier ones, so only the most recent record per key is kept.
+
+    This dramatically reduces file size (e.g. 1.2 GB → tens of MB)
+    and makes downstream parsing fast.
+    """
+    logger.info(
+        "Merge-dedup %d files → %s (key=%s)", len(file_paths), dest.name, key_field,
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    records: dict[str, str] = {}  # key → raw JSON line
+    skipped_files = 0
+    for p in sorted(file_paths):
+        try:
+            with gzip.open(p, "rt", encoding="utf-8", errors="replace") as gz:
+                for line in gz:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    key = str(row.get(key_field, ""))
+                    if key:
+                        records[key] = line
+        except (EOFError, gzip.BadGzipFile, OSError) as exc:
+            logger.warning("Skipping corrupt file %s: %s", p.name, exc)
+            skipped_files += 1
+    logger.info("Deduped to %d unique records", len(records))
+    with gzip.open(dest, "wt", encoding="utf-8") as out:
+        for line in records.values():
+            out.write(line)
+            out.write("\n")
+    logger.info("Wrote %s (%d bytes)", dest.name, dest.stat().st_size)
+    return dest
+
+
+def _merge_dedup_composite(
+    file_paths: list[Path],
+    dest: Path,
+    key_fields: tuple[str, ...],
+) -> Path:
+    """
+    Like ``_merge_dedup`` but the dedup key is a tuple of field values.
+    """
+    logger.info(
+        "Merge-dedup %d files → %s (keys=%s)",
+        len(file_paths), dest.name, key_fields,
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    records: dict[tuple[str, ...], str] = {}
+    skipped_files = 0
+    for p in sorted(file_paths):
+        try:
+            with gzip.open(p, "rt", encoding="utf-8", errors="replace") as gz:
+                for line in gz:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    key = tuple(str(row.get(f, "")) for f in key_fields)
+                    if all(key):
+                        records[key] = line
+        except (EOFError, gzip.BadGzipFile, OSError) as exc:
+            logger.warning("Skipping corrupt file %s: %s", p.name, exc)
+            skipped_files += 1
+    logger.info("Deduped to %d unique records", len(records))
+    with gzip.open(dest, "wt", encoding="utf-8") as out:
+        for line in records.values():
+            out.write(line)
+            out.write("\n")
+    logger.info("Wrote %s (%d bytes)", dest.name, dest.stat().st_size)
     return dest
 
 
@@ -380,23 +464,29 @@ def main() -> None:
     for ft, paths in by_type.items():
         logger.info("  %s: %d files total", ft, len(paths))
 
-    # ── 3. Merge into final output files ─────────────────────────────
+    # ── 3. Merge + deduplicate into final output files ─────────────
     if "track_fingerprint-update" not in by_type:
         logger.error("No track_fingerprint-update files found")
         sys.exit(1)
-    _merge_files(by_type["track_fingerprint-update"], DB_TRACK_FP_JSONL)
+    _merge_dedup_composite(
+        by_type["track_fingerprint-update"], DB_TRACK_FP_JSONL,
+        ("fingerprint_id", "track_id"),
+    )
     if args.max_rows:
         _truncate_jsonl_gz(DB_TRACK_FP_JSONL, args.max_rows)
 
     if "track_meta-update" in by_type:
-        _merge_files(by_type["track_meta-update"], DB_TRACK_META_JSONL)
+        _merge_dedup_composite(
+            by_type["track_meta-update"], DB_TRACK_META_JSONL,
+            ("track_id", "meta_id"),
+        )
         if args.max_rows:
             _truncate_jsonl_gz(DB_TRACK_META_JSONL, args.max_rows)
 
     if "meta-update" not in by_type:
         logger.error("No meta-update files found")
         sys.exit(1)
-    _merge_files(by_type["meta-update"], DB_META_JSONL)
+    _merge_dedup(by_type["meta-update"], DB_META_JSONL, "id")
     if args.max_rows:
         _truncate_jsonl_gz(DB_META_JSONL, args.max_rows)
 
